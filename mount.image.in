@@ -1,0 +1,485 @@
+#!/usr/bin/env bash
+#
+# @(#) mount.image
+#
+# Copyright © 2023 Revolution Robotics, Inc.
+#
+# This script mounts the partitions of a given (possibly compressed)
+# disk image on mount points of the form:
+#     ${MOUNT_IMAGE_BASEDIR}/label
+# where label is the partition label. If a mountable partition does
+# not have a label, the name of the device associated with the
+# partition is used instead.
+#
+# To unmount an image mounted with `mount.image', use the command
+# `umount.image' with argument of either the image or one of the
+# partition mount points.
+#
+#
+: ${AWK_CMD:='@AWK_CMD@'}
+: ${BASH_CMD:='@BASH_CMD@'}
+: ${BLKID_CMD:='@BLKID_CMD@'}
+: ${BZIP2_CMD:='@BZIP2_CMD@'}
+: ${CAT_CMD:='@CAT_CMD@'}
+: ${ED_CMD:='@ED_CMD@'}
+: ${FINDMNT_CMD:='@FINDMNT_CMD@'}
+: ${FLOCK_CMD:='@FLOCK_CMD@'}
+: ${GETOPT_CMD:='@GETOPT_CMD@'}
+: ${GREP_CMD:='@GREP_CMD@'}
+: ${GZIP_CMD:='@GZIP_CMD@'}
+: ${INSTALL_CMD:='@INSTALL_CMD@'}
+: ${LOSETUP_CMD:='@LOSETUP_CMD@'}
+: ${LS_CMD:='@LS_CMD@'}
+: ${LSBLK_CMD:='@LSBLK_CMD@'}
+: ${LZIP_CMD:='@LZIP_CMD@'}
+: ${LZMA_CMD:='@LZMA_CMD@'}
+: ${LZOP_CMD:='@LZOP_CMD@'}
+: ${MKTEMP_CMD:='@MKTEMP_CMD@'}
+: ${MOUNT_CMD:='@MOUNT_CMD@'}
+: ${MV_CMD:='@MV_CMD@'}
+: ${PARTPROBE_CMD:='@PARTPROBE_CMD@'}
+: ${READLINK_CMD:='@READLINK_CMD@'}
+: ${RM_CMD:='@RM_CMD@'}
+: ${RMDIR_CMD:='@RMDIR_CMD@'}
+: ${SED_CMD:='@SED_CMD@'}
+: ${SUDO_CMD:='@SUDO_CMD@'}
+: ${UMOUNT_CMD:='@UMOUNT_CMD@'}
+: ${UNZIP_CMD:='@UNZIP_CMD@'}
+: ${XZ_CMD:='@XZ_CMD@'}
+
+: ${MOUNT_IMAGE_CACHE:="/run/mount/umount.restore"}
+: ${MOUNT_IMAGE_BASEDIR:="/media/${USER}"}
+
+pr-error ()
+{
+    echo "Error: $@" >&2
+}
+
+pr-info ()
+{
+    echo "$@" >&2
+}
+
+# OS-agnstoic readlink for existent files/directories.
+resolve-existing ()
+{
+    if $READLINK_CMD --version 2>&1 | $GREP_CMD -q 'coreutils'; then
+        $READLINK_CMD -e "$@"
+    else
+        $READLINK_CMD -f N "$@"
+    fi
+}
+
+compression-specs ()
+{
+    local image=$1
+    local spec_no=${2:-0}
+
+    local -a specs=()
+
+    case $(file "$image") in
+        *bzip2*)
+            specs=( "$BZIP2_CMD -dc"  '.bz2' )
+            ;;
+        *lzip*)
+            specs=( "$LZIP_CMD -dc" '.lz' )
+            ;;
+        *LZMA*)
+            specs=( "$LZMA_CMD -dc" '.lzma' )
+            ;;
+        *lzop*)
+            specs=( "$LZOP_CMD -dc" '.lzo')
+            ;;
+        *gzip*)
+            specs=( "$GZIP_CMD -dc" '.gz' )
+            ;;
+        *XZ*)
+            specs=( "$XZ_CMD -dc" '.xz' )
+            ;;
+        *Zip*)
+            specs=( "$UNZIP_CMD -p" '.zip' )
+            ;;
+        *'ISO 9660'*|*'DOS/MBR boot sector'*)
+            specs=( "$CAT_CMD" '' )
+            ;;
+        *)
+            specs=( 'unknown' 'unknown' )
+            ;;
+    esac
+
+    if test ."$specs" = .'unknown'; then
+        pr-error "${image}: Unrecognized image"
+        return 10
+    fi
+
+    echo "${specs[$spec_no]}"
+}
+
+decompress-image ()
+{
+    local image=$1
+    local image_cat=$2
+
+    local extension=''
+
+    extension=$(compression-specs "$image" 1) || return $?
+
+    local decompressed_image=${image%${extension}}
+    local tmpfile=''
+
+    tmpfile=$($MKTEMP_CMD "${decompressed_image}.XXXXX") || return $?
+
+    trap '$RM_CMD -f "$tmpfile"' 0 1 2 15 RETURN
+
+    $image_cat "$image" >"$tmpfile" || return $?
+
+    trap - 0 1 2 15 RETURN
+
+    echo "$tmpfile"
+}
+
+log-restore-method ()
+{
+    local image=$1
+    local compressor=$2
+    local compressed_image=$3
+
+    $SUDO_CMD $BASH_CMD -c "
+            $INSTALL_CMD -d -m 0755 /run/mount
+            {
+               $FLOCK_CMD 3
+               printf '${image}\\t${compressor}\\t${compressed_image}\\n' >&3
+            } 3>>/run/mount/umount.restore" || return $?
+}
+
+loop-attach-image ()
+{
+    local image=$1
+
+    local device=''
+
+    if ! device=$(
+            $SUDO_CMD $LOSETUP_CMD --sector-size 512  --nooverlap \
+                      --find --show "$image"
+         ); then
+        pr-error "${FUNCNAME[0]}: ${device}: Invalid loop device"
+        return 20
+    fi
+
+    echo "$device"
+}
+
+attach-image ()
+{
+    local image=$1
+
+    image=$(resolve-existing "$image") || return $?
+
+    local image_cat=''
+    image_cat=$(compression-specs "$image") || return $?
+
+    if test ."$image_cat" != ."$CAT_CMD"; then
+        local compressed_image=$image
+
+        image=$(decompress-image "$compressed_image" "$image_cat") || return $?
+        log-restore-method "$image" "${image_cat%% *}" "$compressed_image" || return $?
+    fi
+
+    local device=''
+
+    device=$(loop-attach-image "$image") || return $?
+
+    echo $device
+}
+
+next-free-path ()
+{
+    local base=$1
+
+    local next=$base
+    local -i i=0
+
+    while test -e "$next"; do
+        next=${base}$(( ++i ))
+    done
+
+    echo "$next"
+}
+
+mount-device-partitions ()
+{
+    local device=$1
+
+    local partition=''
+    local -a partitions=()
+    local label=''
+    local mount_point=''
+
+    $SUDO_CMD $PARTPROBE_CMD "$device"
+    mapfile -t partitions < <($LS_CMD -1 "${device}p"* 2>/dev/null)
+
+    for partition in "${partitions[@]}"; do
+        $SUDO_CMD $BLKID_CMD "$partition" |
+            $GREP_CMD -qE '\<TYPE=[^[:space:]]+' || continue
+        label=$(
+            $SUDO_CMD $BLKID_CMD "$partition" |
+                $GREP_CMD -Po '(?<=\bLABEL=")[^"[:space:]]+'
+             ) || true
+
+        if test ."$label" != .''; then
+            mount_point=$(next-free-path "${MOUNT_IMAGE_BASEDIR}/${label}")
+        else
+            mount_point=$(next-free-path "${MOUNT_IMAGE_BASEDIR}/${partition##*/}")
+        fi
+
+        if test ."$mount_point" = .''; then
+            pr-error "${FUNCNAME[0]}: Create mount point failed"
+            continue
+        elif $FINDMNT_CMD "$mount_point" >/dev/null; then
+            pr-error "${FUNCNAME[0]}: ${mount_point}: Cannot overwrite"
+            continue
+        elif ! $SUDO_CMD $INSTALL_CMD -d -m 0755 "$mount_point"; then
+            pr-error "${FUNCNAME[0]}: ${mount_point}: Permission denied"
+            continue
+        elif ! $SUDO_CMD $MOUNT_CMD "$partition" "$mount_point"; then
+            pr-error "${FUNCNAME[0]}: ${partition}: Mount failed"
+            continue
+        fi
+        pr-info "$mount_point"
+    done
+}
+
+get-mounted-device ()
+{
+    local mount_point=$1
+
+    local device=''
+
+    if ! device=$(
+            $FINDMNT_CMD -n "$mount_point" |
+                $AWK_CMD '{ print $2 }'
+         ); then
+        pr-error "${FUNCNAME[0]}: ${mount_point}: Invalid mount point"
+        return 40
+    fi
+
+    echo "$device"
+}
+
+get-backing-image ()
+{
+    local device=$1
+
+    local backing_image=''
+
+    if ! backing_image=$(
+            $LOSETUP_CMD -l |
+                $AWK_CMD '$1 == "'"$device"'" { print $6 }'
+         ); then
+        pr-error "${FUNCNAME[0]}: ${device}: Invalid loop device"
+        return 50
+    fi
+
+    echo "$backing_image"
+}
+
+umount-device-partitions ()
+{
+    local device=$1
+
+    local mount_point=''
+
+    for part in p{1..9}; do
+        $SUDO_CMD $BLKID_CMD "${device}${part}" |
+            $GREP_CMD -qE '\<TYPE=[^[:space:]]+' || continue
+        if ! mount_point=$(
+                $FINDMNT_CMD -n "${device}${part}" |
+                    $AWK_CMD '{ print $1 }'
+             ); then
+            pr-error "${FUNCNAME[0]}: ${device}${part}: Mount point not found"
+            return 60
+        elif test ."$mount_point" = .''; then
+            continue
+        elif ! $SUDO_CMD $UMOUNT_CMD -f "$mount_point"; then
+            pr-error "${FUNCNAME[0]}: ${mount_point}: Umount failed"
+            return 61
+        elif ! $SUDO_CMD $RMDIR_CMD "$mount_point"; then
+            pr-error "${FUNCNAME[0]}: ${mount_point}: Permission denied"
+            return 62
+        fi
+    done
+}
+
+detach-device ()
+{
+    local device=$1
+
+    if test -b "$device"; then
+        if ! $SUDO_CMD $LOSETUP_CMD -d "$device" &>/dev/null; then
+            pr-error "${FUNCNAME[0]}: ${device}: Loop detach failed"
+            return 30
+        fi
+    fi
+}
+
+umount-image-by-mount-point ()
+{
+    local mount_point=$1
+
+    local device=''
+    local backing_image=''
+
+    device=$(get-mounted-device "$mount_point") || return $?
+    backing_image=$(get-backing-image "$device") || return $?
+
+    local base_device=${device%p+([0-9])}
+
+    umount-device-partitions "$base_device" || return $?
+    detach-device "$base_device" || return $?
+    echo "$backing_image"
+}
+
+regex-escape ()
+{
+    local regex=$1
+
+    local escaped=''
+
+    escaped=$($SED_CMD -e 's/[][/\*+.|$]/\\&/g'  <<<"$regex") || return $?
+
+    echo "$escaped"
+}
+
+get-image-device ()
+{
+    local image=$1
+
+    image=$(regex-escape "$image") || return $?
+
+    local -a devices=()
+
+    mapfile -t devices < <(
+        $LOSETUP_CMD -l |
+            $AWK_CMD '$6 ~ /'"${image}"'(.[[:alnum:]]+)?/ { print $1 }'
+    )
+
+    if (( ${#devices[*]} > 1 )); then
+        pr-error "${FUNCNAME[0]}: ${image}: Ambiguous; Use mount point instead."
+        return 71
+    elif (( ${#devices[*]} < 1 )); then
+        pr-error "${FUNCNAME[0]}: ${image}: Not loop attached."
+        return 72
+    fi
+
+    echo "${devices[0]}"
+}
+
+umount-image ()
+{
+    local image=$1
+
+    image=$(resolve-existing "$image") || return $?
+
+    local image_cat=''
+
+    image_cat=$(compression-specs "$image") || return $?
+
+    local compressed_image=''
+
+    if test ."$image_cat" != ."$CAT_CMD"; then
+        compressed_image=$image
+
+        extension=$(compression-specs "$compressed_image" 1) || return $?
+        image=${compressed_image%${extension}}
+    fi
+
+    local device=''
+
+    device=$(get-image-device "$image") || return $?
+    umount-device-partitions "$device" || return $?
+
+    local backing_image=''
+
+    backing_image=$(get-backing-image "$device") || return $?
+    detach-device "$device" || return $?
+
+    echo "$backing_image"
+}
+
+restore-image ()
+{
+    local backing_image=$1
+
+    local -a restore_parameters=()
+
+    # Assert: $backing_image exists in /run/mount/umount.restore
+    mapfile -t restore_parameters < <(
+        $SUDO_CMD $ED_CMD -Ei -e 'g;^'"$backing_image"'[[:space:]]+;\
+s;;;\
+s;[[:space:]]+;\
+;\
+-,.p\
+-,.d' /run/mount/umount.restore
+    )
+
+    if (( ${#restore_parameters[*]} > 0 )); then
+        ${restore_parameters[0]} "$backing_image"
+
+        local extension=.${restore_parameters[1]##*.}
+
+        $MV_CMD -f "${restore_parameters[1]}" "${restore_parameters[1]}.old" || return $?
+        $MV_CMD -f "${backing_image}${extension}" "${restore_parameters[1]}"
+    fi
+}
+
+if test ."$0" = ."${BASH_SOURCE[0]}"; then
+    declare script_name=${0##*/}
+
+    case "$0" in
+        */mount.image)
+            declare image=''
+            declare device=''
+
+            if (( $# == 0 )); then
+                pr-info "Usage: ${script_name} disk-image [...]"
+                exit 1
+            fi
+
+            for image in "$@"; do
+                if test ! -f "$image"; then
+                    pr-error "${script_name}: ${image}: Invalid image"
+                    continue
+                elif ! device=$(attach-image "$image"); then
+                    pr-error "${script_name}: ${image}: Loop attach failed"
+                    continue
+                fi
+                mount-device-partitions "$device"
+            done
+            ;;
+        */umount.image)
+            declare path=''
+            declare backing_image=''
+
+            if (( $# == 0 )); then
+                pr-info "Usage: ${script_name} disk-image | mount-point [...]"
+                exit 1
+            fi
+
+            for path in "$@"; do
+                if test -f "$path"; then
+                    backing_image=$(umount-image "$path") || exit $?
+                elif test -d "$path"; then
+                    backing_image=$(umount-image-by-mount-point "$path") || exit $?
+                else
+                    pr-error "${script_name}: ${path}: No such file or directory"
+                    continue
+                fi
+
+                if test -f "$MOUNT_IMAGE_CACHE" \
+                        && $GREP_CMD -Eq '^'"$backing_image"'[[:space:]]+' "$MOUNT_IMAGE_CACHE"; then
+                    restore-image "$backing_image"
+                fi
+            done
+            ;;
+    esac
+fi
