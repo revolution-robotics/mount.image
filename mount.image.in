@@ -7,20 +7,20 @@
 # This script mounts the partitions of a given (possibly compressed)
 # disk image on mount points of the form:
 #     ${MOUNT_IMAGE_BASEDIR}/label
-# where label is the partition label. If a mountable partition does
-# not have a label, the name of the device associated with the
-# partition is used instead.
+# where $MOUNT_IMAGE_BASEDIR is either /media/$USER or
+# /run/media/$USER, depending on the OS, and label is the partition
+# label. If a mountable partition does not have a label, the name of
+# the device associated with the partition is used instead.
 #
 # To unmount an image mounted with `mount.image', use the command
 # `umount.image' with argument of either the image or one of the
 # partition mount points.
 #
 #
-: ${AWK_CMD:='@AWK_CMD@'}
 : ${BASH_CMD:='@BASH_CMD@'}
-: ${BLKID_CMD:='@BLKID_CMD@'}
 : ${BZIP2_CMD:='@BZIP2_CMD@'}
 : ${CAT_CMD:='@CAT_CMD@'}
+: ${DMSETUP_CMD:='@DMSETUP_CMD@'}
 : ${ED_CMD:='@ED_CMD@'}
 : ${FINDMNT_CMD:='@FINDMNT_CMD@'}
 : ${FLOCK_CMD:='@FLOCK_CMD@'}
@@ -28,9 +28,11 @@
 : ${GREP_CMD:='@GREP_CMD@'}
 : ${GZIP_CMD:='@GZIP_CMD@'}
 : ${INSTALL_CMD:='@INSTALL_CMD@'}
+: ${JQ_CMD:='@JQ_CMD@'}
+: ${KPARTX_CMD:='@KPARTX_CMD@'}
 : ${LOSETUP_CMD:='@LOSETUP_CMD@'}
-: ${LS_CMD:='@LS_CMD@'}
 : ${LSBLK_CMD:='@LSBLK_CMD@'}
+: ${LVS_CMD:='@LVS_CMD@'}
 : ${LZIP_CMD:='@LZIP_CMD@'}
 : ${LZMA_CMD:='@LZMA_CMD@'}
 : ${LZOP_CMD:='@LZOP_CMD@'}
@@ -42,22 +44,35 @@
 : ${RM_CMD:='@RM_CMD@'}
 : ${RMDIR_CMD:='@RMDIR_CMD@'}
 : ${SED_CMD:='@SED_CMD@'}
+: ${SEQ_CMD:='@SEQ_CMD@'}
 : ${SUDO_CMD:='@SUDO_CMD@'}
+: ${TR_CMD:='@TR_CMD@'}
 : ${UMOUNT_CMD:='@UMOUNT_CMD@'}
 : ${UNZIP_CMD:='@UNZIP_CMD@'}
+: ${VGCHANGE_CMD:='@VGCHANGE_CMD@'}
+: ${VGS_CMD:='@VGS_CMD@'}
 : ${XZ_CMD:='@XZ_CMD@'}
 
-: ${MOUNT_IMAGE_CACHE:="/run/mount/umount.restore"}
-: ${MOUNT_IMAGE_BASEDIR:="/media/${USER}"}
-
-pr-error ()
-{
-    echo "Error: $@" >&2
-}
+: ${MOUNT_IMAGE_CACHE:='/run/mount/umount.restore'}
+if test -d /run/media; then
+    : ${MOUNT_IMAGE_BASEDIR:="/run/media/${USER}"}
+else
+    : ${MOUNT_IMAGE_BASEDIR:="/media/${USER}"}
+fi
 
 pr-info ()
 {
     echo "$@" >&2
+}
+
+pr-warn ()
+{
+    echo "Warning: $@" >&2
+}
+
+pr-error ()
+{
+    echo "Error: $@" >&2
 }
 
 # OS-agnstoic readlink for existent files/directories.
@@ -68,6 +83,27 @@ resolve-existing ()
     else
         $READLINK_CMD -f N "$@"
     fi
+}
+
+verify-input ()
+{
+    local prompt=$1
+
+    local reply=''
+
+    while [[ ! ."$reply" =~ \.([yY]|[nN]) ]]; do
+        read -N 1 -p "$prompt" reply
+        echo >&2
+    done
+
+    case $reply in
+        [yY])
+            return 0
+            ;;
+        [nN])
+            return 1
+            ;;
+    esac
 }
 
 compression-specs ()
@@ -115,27 +151,65 @@ compression-specs ()
     echo "${specs[$spec_no]}"
 }
 
+regex-escape ()
+{
+    local regex=$1
+
+    local escaped=''
+
+    if ! escaped=$($SED_CMD -e 's/[][/\*+.|$]/\\&/g'  <<<"$regex"); then
+        pr-error "${FUNCNAME[0]}: ${backing_image}: Escape failed"
+        return 1
+    fi
+
+    echo "$escaped"
+}
+
 decompress-image ()
 {
-    local image=$1
+    local compressed_image=$1
     local image_cat=$2
+    local -n tmpfile=$3
+    local -n backing_images=$4
+
+    # Check $MOUNT_IMAGE_CACHE for existing decompressed image(s).
+    if test -f "$MOUNT_IMAGE_CACHE"; then
+        local image_escaped=''
+
+        image_escaped=$(regex-escape "$compressed_image") || return $?
+        mapfile -t backing_images < <(
+            $SUDO_CMD $SED_CMD -En -e '/[[:space:]]+'"$image_escaped"'$/s/[[:space:]]+.*$//p' "$MOUNT_IMAGE_CACHE"
+        )
+
+        tmpfile=''
+
+        for i in $($SEQ_CMD $(( ${#backing_images[*]} - 1 )) -1 0); do
+            if test -f "${backing_images[i]}"; then
+                tmpfile=${backing_images[i]}
+                break
+            else
+                # Remove stale image from cache.
+                image_escaped=$(regex-escape "${backing_image[i]}") || return $?
+                $SUDO_CMD $SED_CMD -Ei -e '/^'"$image_escaped"'[[:space:]]+/d' "$MOUNT_IMAGE_CACHE"
+            fi
+        done
+    fi
 
     local extension=''
+    local decompressed_image=''
 
-    extension=$(compression-specs "$image" 1) || return $?
+    if test ."$tmpfile" = .''; then
+        extension=$(compression-specs "$compressed_image" 1) || return $?
+        decompressed_image=${compressed_image%${extension}}
+        tmpfile=$($MKTEMP_CMD "${decompressed_image}.XXXXX") || return $?
 
-    local decompressed_image=${image%${extension}}
-    local tmpfile=''
+        trap '$RM_CMD -f "$tmpfile"' 0 1 2 15 RETURN
 
-    tmpfile=$($MKTEMP_CMD "${decompressed_image}.XXXXX") || return $?
+        pr-info "${script_name}: ${compressed_image}: Decompressing.  Please wait..."
+        $image_cat "$compressed_image" >"$tmpfile" || return $?
 
-    trap '$RM_CMD -f "$tmpfile"' 0 1 2 15 RETURN
-
-    $image_cat "$image" >"$tmpfile" || return $?
-
-    trap - 0 1 2 15 RETURN
-
-    echo "$tmpfile"
+        trap - 0 1 2 15 RETURN
+    fi
 }
 
 log-restore-method ()
@@ -145,11 +219,11 @@ log-restore-method ()
     local compressed_image=$3
 
     $SUDO_CMD $BASH_CMD -c "
-            $INSTALL_CMD -d -m 0755 /run/mount
+            $INSTALL_CMD -d -m 0755 '${MOUNT_IMAGE_CACHE%/*}/'
             {
                $FLOCK_CMD 3
                printf '${image}\\t${compressor}\\t${compressed_image}\\n' >&3
-            } 3>>/run/mount/umount.restore" || return $?
+            } 3>>'$MOUNT_IMAGE_CACHE'" || return $?
 }
 
 loop-attach-image ()
@@ -179,10 +253,15 @@ attach-image ()
     image_cat=$(compression-specs "$image") || return $?
 
     if test ."$image_cat" != ."$CAT_CMD"; then
+        local -a decompressed_images=()
+        local -a existing_images=()
         local compressed_image=$image
 
-        image=$(decompress-image "$compressed_image" "$image_cat") || return $?
-        log-restore-method "$image" "${image_cat%% *}" "$compressed_image" || return $?
+        image=''
+        decompress-image "$compressed_image" "$image_cat" image existing_images || return $?
+        if (( ${#existing_images[*]} == 0 )); then
+            log-restore-method "$image" "${image_cat%% *}" "$compressed_image" || return $?
+        fi
     fi
 
     local device=''
@@ -206,45 +285,122 @@ next-free-path ()
     echo "$next"
 }
 
+mount-filesystem ()
+{
+    local device=$1
+
+    local label=''
+    local mount_point=''
+
+    label=$($LSBLK_CMD -no LABEL "$device") || return $?
+
+    if test ."$label" != .''; then
+        mount_point=$(next-free-path "${MOUNT_IMAGE_BASEDIR}/${label}")
+    else
+        mount_point=$(next-free-path "${MOUNT_IMAGE_BASEDIR}/${device##*/}")
+    fi
+
+    if test ."$mount_point" = .''; then
+        pr-error "${FUNCNAME[0]}: Create mount point failed"
+        return 1
+    elif $FINDMNT_CMD "$mount_point" >/dev/null; then
+        pr-error "${FUNCNAME[0]}: ${mount_point}: Cannot overwrite"
+        return 2
+    elif ! $SUDO_CMD $INSTALL_CMD -d -m 0700 -o "$USER" "$mount_point"; then
+        pr-error "${FUNCNAME[0]}: ${mount_point}: Permission denied"
+        return 3
+    fi
+
+    $SUDO_CMD $MOUNT_CMD "$device" "$mount_point"
+
+    echo "$mount_point"
+}
+
+mount-lvm2 ()
+{
+    local partition=$1
+
+    $SUDO_CMD $KPARTX_CMD -a "$partition"
+
+    local -a volume_groups=()
+
+    mapfile -t volume_groups < <(
+        $SUDO_CMD $VGS_CMD --noheadings -o vg_name --devices "$partition" |
+            $TR_CMD -d ' '
+    )
+
+    local volume_group=''
+
+    for volume_group in "${volume_groups[@]}"; do
+        $SUDO_CMD $VGCHANGE_CMD -ay "$volume_group"
+
+        local -a lv_paths=()
+
+        mapfile -t lv_paths< <(
+            $SUDO_CMD $LVS_CMD --noheadings -o lv_path --devices "$partition" "$volume_group" |
+                $TR_CMD -d ' '
+        )
+
+        local lv_path=''
+
+        for lv_path in "${lv_paths[@]}"; do
+            fstype=($LSBLK_CMD -no FSTYPE "$lv_path")
+
+            if test ."$fstype" = .'' -o ."$fstype" = .'swap'; then
+                continue
+            fi
+
+            mount-filesystem "$lv_path"
+        done
+    done
+}
+
 mount-device-partitions ()
 {
     local device=$1
 
     local partition=''
     local -a partitions=()
-    local label=''
-    local mount_point=''
 
     $SUDO_CMD $PARTPROBE_CMD "$device"
-    mapfile -t partitions < <($LS_CMD -1 "${device}p"* 2>/dev/null)
+    mapfile -t partitions < <(printf '%s\n' "${device}p"*)
 
     for partition in "${partitions[@]}"; do
-        $SUDO_CMD $BLKID_CMD "$partition" |
-            $GREP_CMD -qE '\<TYPE=[^[:space:]]+' || continue
-        label=$(
-            $SUDO_CMD $BLKID_CMD "$partition" |
-                $GREP_CMD -Po '(?<=\bLABEL=")[^"[:space:]]+'
-             ) || true
+        local mount_point=''
+        local -a fstypes=()
+        local fstype=''
 
-        if test ."$label" != .''; then
-            mount_point=$(next-free-path "${MOUNT_IMAGE_BASEDIR}/${label}")
+        mapfile -t fstypes < <($LSBLK_CMD -no FSTYPE "$partition")
+
+        if (( ${#fstypes[*]} > 1 )); then
+            # Previously attached LVM2 volume.
+            fstype=LVM2_member
         else
-            mount_point=$(next-free-path "${MOUNT_IMAGE_BASEDIR}/${partition##*/}")
+            fstype=${fstypes[0]}
         fi
 
-        if test ."$mount_point" = .''; then
-            pr-error "${FUNCNAME[0]}: Create mount point failed"
-            continue
-        elif $FINDMNT_CMD "$mount_point" >/dev/null; then
-            pr-error "${FUNCNAME[0]}: ${mount_point}: Cannot overwrite"
-            continue
-        elif ! $SUDO_CMD $INSTALL_CMD -d -m 0755 "$mount_point"; then
-            pr-error "${FUNCNAME[0]}: ${mount_point}: Permission denied"
-            continue
-        elif ! $SUDO_CMD $MOUNT_CMD "$partition" "$mount_point"; then
-            pr-error "${FUNCNAME[0]}: ${partition}: Mount failed"
+        if test ."$fstype" = .'' -o ."$fstype" = .'swap'; then
             continue
         fi
+
+        case "$fstype" in
+            *swap|'')
+                continue
+                ;;
+            LVM2_member)
+                if ! mount_point=$(mount-lvm2 "$partition"); then
+                    pr-error "${FUNCNAME[0]}: ${partition}: LVM2 mount failed"
+                    continue
+                fi
+                ;;
+            *)
+                if ! mount_point=$(mount-filesystem "$partition"); then
+                    pr-error "${FUNCNAME[0]}: ${partition}: Mount failed"
+                    continue
+                fi
+                ;;
+        esac
+
         pr-info "$mount_point"
     done
 }
@@ -255,10 +411,7 @@ get-mounted-device ()
 
     local device=''
 
-    if ! device=$(
-            $FINDMNT_CMD -n "$mount_point" |
-                $AWK_CMD '{ print $2 }'
-         ); then
+    if ! device=$($FINDMNT_CMD -no SOURCE "$mount_point"); then
         pr-error "${FUNCNAME[0]}: ${mount_point}: Invalid mount point"
         return 40
     fi
@@ -272,10 +425,7 @@ get-backing-image ()
 
     local backing_image=''
 
-    if ! backing_image=$(
-            $LOSETUP_CMD -l |
-                $AWK_CMD '$1 == "'"$device"'" { print $6 }'
-         ); then
+    if ! backing_image=$($LOSETUP_CMD -nO BACK-FILE "$device"); then
         pr-error "${FUNCNAME[0]}: ${device}: Invalid loop device"
         return 50
     fi
@@ -283,23 +433,16 @@ get-backing-image ()
     echo "$backing_image"
 }
 
-umount-device-partitions ()
+umount-filesystem ()
 {
-    local device=$1
+    local partition=$1
+    local -n mounts=$2
 
     local mount_point=''
 
-    for part in p{1..9}; do
-        $SUDO_CMD $BLKID_CMD "${device}${part}" |
-            $GREP_CMD -qE '\<TYPE=[^[:space:]]+' || continue
-        if ! mount_point=$(
-                $FINDMNT_CMD -n "${device}${part}" |
-                    $AWK_CMD '{ print $1 }'
-             ); then
-            pr-error "${FUNCNAME[0]}: ${device}${part}: Mount point not found"
-            return 60
-        elif test ."$mount_point" = .''; then
-            continue
+    for mount_point in "${mounts[@]}"; do
+        if test ."$mount_point" = .''; then
+            pr-warn "${FUNCNAME[0]}: ${partition}: Empty mount point"
         elif ! $SUDO_CMD $UMOUNT_CMD -f "$mount_point"; then
             pr-error "${FUNCNAME[0]}: ${mount_point}: Umount failed"
             return 61
@@ -307,6 +450,96 @@ umount-device-partitions ()
             pr-error "${FUNCNAME[0]}: ${mount_point}: Permission denied"
             return 62
         fi
+    done
+}
+
+umount-lvm2 ()
+{
+    local partition=$1
+    local -n _mount_points=$2
+
+    mapfile -t volume_groups < <(
+        $SUDO_CMD $VGS_CMD --noheadings -o vg_name --devices "$partition" |
+            $TR_CMD -d ' '
+    )
+
+    local volume_group=''
+
+    for volume_group in "${volume_groups[@]}"; do
+        local -a lv_paths=()
+
+        mapfile -t lv_paths< <(
+            $SUDO_CMD $LVS_CMD --noheadings -o lv_path --devices "$partition" "$volume_group" |
+                $TR_CMD -d ' '
+        )
+
+        local lv_path=''
+
+        for lv_path in "${lv_paths[@]}"; do
+            local fstype=''
+
+            fstype=($LSBLK_CMD -no FSTYPE "$lv_path") || continue
+
+            if test ."$fstype" = .'' -o ."$fstype" = .'swap'; then
+                continue
+            fi
+
+            umount-filesystem "$lv_path" _mount_points || return $?
+
+            local dm_device=''
+
+            dm_device=$($READLINK_CMD -e "$lv_path") || continue
+            $SUDO_CMD $DMSETUP_CMD remove "$dm_device" || return $?
+        done
+    done
+}
+
+umount-device-partitions ()
+{
+    local device=$1
+
+    for part in p{1..9}; do
+        test -b "${device}${part}" || continue
+
+        local -a mount_points=()
+
+        mapfile -t mount_points < <(
+            $LSBLK_CMD -no MOUNTPOINTS "${device}${part}" |
+                $SED_CMD -e '/^$/d'
+        )
+
+        if (( ${#mount_points[*]} > 1 )); then
+            if ! verify-input "${FUNCNAME[0]}: ${device}${part}: Unmount multiple mount points? "; then
+                return 70
+            fi
+        fi
+
+        local -a fstypes=()
+        local fstype=''
+
+        mapfile -t fstypes < <(
+            $LSBLK_CMD -no FSTYPE "${device}${part}" |
+                $SED_CMD -e '/^$/d'
+        )
+
+        if (( ${#fstypes[*]} > 1 )); then
+            # Previously attached LVM2 volume.
+            fstype=LVM2_member
+        else
+            fstype=${fstypes[0]}
+        fi
+
+        case "$fstype" in
+            '')
+                continue
+                ;;
+            LVM2_member)
+                umount-lvm2 "${device}${part}" mount_points || return $?
+                ;;
+            *)
+                umount-filesystem "${device}${part}" mount_points || return $?
+                ;;
+        esac
     done
 }
 
@@ -330,41 +563,35 @@ umount-image-by-mount-point ()
     local backing_image=''
 
     device=$(get-mounted-device "$mount_point") || return $?
-    backing_image=$(get-backing-image "$device") || return $?
 
-    local base_device=${device%p+([0-9])}
+    local base_device=''
 
+    base_device=${device%p+([0-9])}
+
+    backing_image=$(get-backing-image "$base_device") || return $?
     umount-device-partitions "$base_device" || return $?
     detach-device "$base_device" || return $?
     echo "$backing_image"
-}
-
-regex-escape ()
-{
-    local regex=$1
-
-    local escaped=''
-
-    escaped=$($SED_CMD -e 's/[][/\*+.|$]/\\&/g'  <<<"$regex") || return $?
-
-    echo "$escaped"
 }
 
 get-image-device ()
 {
     local image=$1
 
-    image=$(regex-escape "$image") || return $?
-
     local -a devices=()
 
     mapfile -t devices < <(
-        $LOSETUP_CMD -l |
-            $AWK_CMD '$6 ~ /'"${image}"'(.[[:alnum:]]+)?/ { print $1 }'
-    )
+        $LOSETUP_CMD -lJ  |
+            $JQ_CMD -r '.loopdevices |
+                .[] |
+                select(
+                    ."back-file" |
+                     startswith("'"$image"'")
+                ) | .name'
+        )
 
     if (( ${#devices[*]} > 1 )); then
-        pr-error "${FUNCNAME[0]}: ${image}: Ambiguous; Use mount point instead."
+        pr-error "${FUNCNAME[0]}: ${image}: Ambiguous - use mount point instead."
         return 71
     elif (( ${#devices[*]} < 1 )); then
         pr-error "${FUNCNAME[0]}: ${image}: Not loop attached."
@@ -406,24 +633,31 @@ umount-image ()
     echo "$backing_image"
 }
 
-restore-image ()
+maybe-compress-image ()
 {
     local backing_image=$1
 
     local -a restore_parameters=()
+    local backing_image_escaped=''
 
-    # Assert: $backing_image exists in /run/mount/umount.restore
+    backing_image_escaped=$(regex-escape "$backing_image") || return $?
+
+    # Assert: $backing_image exists in $MOUNT_IMAGE_CACHE
     mapfile -t restore_parameters < <(
-        $SUDO_CMD $ED_CMD -Ei -e 'g;^'"$backing_image"'[[:space:]]+;\
-s;;;\
-s;[[:space:]]+;\
-;\
--,.p\
--,.d' /run/mount/umount.restore
-    )
+        $SUDO_CMD $ED_CMD -Es "$MOUNT_IMAGE_CACHE" <<EOF
+g;^$backing_image_escaped[[:space:]]+;\\
+s;;;\\
+s;[[:space:]]+;\\
+;
+-,.p
+-,.d
+wq
+EOF
+)
 
     if (( ${#restore_parameters[*]} > 0 )); then
-        ${restore_parameters[0]} "$backing_image"
+        pr-info "${script_name}: ${restore_parameters[1]%.*}: Compressing. Please wait..."
+        ${restore_parameters[0]} "$backing_image" || return $?
 
         local extension=.${restore_parameters[1]##*.}
 
@@ -435,6 +669,8 @@ s;[[:space:]]+;\
 if test ."$0" = ."${BASH_SOURCE[0]}"; then
     declare script_name=${0##*/}
 
+    shopt -s extglob
+
     case "$0" in
         */mount.image)
             declare image=''
@@ -444,6 +680,8 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
                 pr-info "Usage: ${script_name} disk-image [...]"
                 exit 1
             fi
+
+            $INSTALL_CMD -d -m 0750 -o root -g root "$MOUNT_IMAGE_BASEDIR" || exit 1
 
             for image in "$@"; do
                 if test ! -f "$image"; then
@@ -475,9 +713,14 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
                     continue
                 fi
 
-                if test -f "$MOUNT_IMAGE_CACHE" \
-                        && $GREP_CMD -Eq '^'"$backing_image"'[[:space:]]+' "$MOUNT_IMAGE_CACHE"; then
-                    restore-image "$backing_image"
+                if test -f "$MOUNT_IMAGE_CACHE"; then
+                    declare backing_image_escaped=''
+
+                    backing_image_escaped=$(regex-escape "$backing_image") || continue
+
+                    if $GREP_CMD -Eq '^'"$backing_image_escaped"'[[:space:]]+' "$MOUNT_IMAGE_CACHE" 2>/dev/null; then
+                        maybe-compress-image "$backing_image"
+                    fi
                 fi
             done
             ;;

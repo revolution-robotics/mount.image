@@ -7,7 +7,7 @@
 
 ## Description
 
-The `mount.image` command mounts the partitions of a (possibly
+The `mount.image` command mounts partitions and logical volumes of a (possibly
 compressed) disk image on mount points of the form:
 
 ```
@@ -19,8 +19,8 @@ have a label, then the name of the device associated with the
 partition is used instead.
 
 To unmount an image mounted with `mount.image`, use the command
-`umount.image` with argument of either the image or one of the
-partition mount points.
+`umount.image` with the same argument as used with `mount.image`.
+Alternatively, one of the mount points can be given as an argument.
 
 ## Synopsis
 
