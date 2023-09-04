@@ -176,6 +176,8 @@ decompress-image ()
     local -n tmpfile=$3
     local -n backing_images=$4
 
+    tmpfile=''
+
     # Check $MOUNT_IMAGE_CACHE for existing decompressed image(s).
     if test -f "$MOUNT_IMAGE_CACHE"; then
         local image_escaped=''
@@ -184,8 +186,6 @@ decompress-image ()
         mapfile -t backing_images < <(
             $SUDO_CMD $SED_CMD -En -e '/[[:space:]]+'"$image_escaped"'$/s/[[:space:]]+.*$//p' "$MOUNT_IMAGE_CACHE"
         )
-
-        tmpfile=''
 
         for i in $($SEQ_CMD $(( ${#backing_images[*]} - 1 )) -1 0); do
             if test -f "${backing_images[i]}"; then
