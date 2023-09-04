@@ -93,6 +93,7 @@ AC_PATH_PROG([UNZIP_CMD],       [unzip],              [], [${OPT_PREFIX}${PATH}]
 AC_PATH_PROG([VGCHANGE_CMD],    [vgchange])
 AC_PATH_PROG([VGS_CMD],         [vgs])
 AC_PATH_PROG([XZ_CMD],          [xz],                 [], [${OPT_PREFIX}${PATH}])
+AC_PATH_PROG([ZSTD_CMD],        [zstd],               [], [${OPT_PREFIX}${PATH}])
 
 AC_CONFIG_FILES([Makefile])
 AC_CONFIG_FILES([mount.image],                          [chmod +x mount.image;

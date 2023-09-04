@@ -52,6 +52,7 @@
 : ${VGCHANGE_CMD:='@VGCHANGE_CMD@'}
 : ${VGS_CMD:='@VGS_CMD@'}
 : ${XZ_CMD:='@XZ_CMD@'}
+: ${ZSTD_CMD:='@ZSTD_CMD@'}
 
 : ${MOUNT_IMAGE_CACHE:='/run/mount/umount.restore'}
 if test -d /run/media; then
@@ -134,6 +135,9 @@ compression-specs ()
             ;;
         *Zip*)
             specs=( "$UNZIP_CMD -p" '.zip' )
+            ;;
+        *Zstandard*)
+            specs=( "$ZSTD_CMD -dc" '.zst' )
             ;;
         *'ISO 9660'*|*'DOS/MBR boot sector'*)
             specs=( "$CAT_CMD" '' )
@@ -662,7 +666,10 @@ EOF
         local extension=.${restore_parameters[1]##*.}
 
         $MV_CMD -f "${restore_parameters[1]}" "${restore_parameters[1]}.old" || return $?
-        $MV_CMD -f "${backing_image}${extension}" "${restore_parameters[1]}"
+        $MV_CMD -f "${backing_image}${extension}" "${restore_parameters[1]}" || return $?
+
+        # zstd, e.g., does not remove original.
+        $RM_CMD -f "$backing_image"
     fi
 }
 
