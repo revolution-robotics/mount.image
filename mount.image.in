@@ -45,6 +45,7 @@
 : ${RMDIR_CMD:='@RMDIR_CMD@'}
 : ${SED_CMD:='@SED_CMD@'}
 : ${SEQ_CMD:='@SEQ_CMD@'}
+: ${SLEEP_CMD:='@SLEEP_CMD@'}
 : ${SUDO_CMD:='@SUDO_CMD@'}
 : ${TR_CMD:='@TR_CMD@'}
 : ${UMOUNT_CMD:='@UMOUNT_CMD@'}
@@ -107,52 +108,48 @@ verify-input ()
     esac
 }
 
-compression-specs ()
+get-compression-specs ()
 {
     local image=$1
-    local spec_no=${2:-0}
-
-    local -a specs=()
+    local -n compression_specs=$2
 
     case $(file "$image") in
         *bzip2*)
-            specs=( "$BZIP2_CMD -dc"  '.bz2' )
+            compression_specs=( "$BZIP2_CMD -dc"  '.bz2' )
             ;;
         *lzip*)
-            specs=( "$LZIP_CMD -dc" '.lz' )
+            compression_specs=( "$LZIP_CMD -dc" '.lz' )
             ;;
         *LZMA*)
-            specs=( "$LZMA_CMD -dc" '.lzma' )
+            compression_specs=( "$LZMA_CMD -dc" '.lzma' )
             ;;
         *lzop*)
-            specs=( "$LZOP_CMD -dc" '.lzo')
+            compression_specs=( "$LZOP_CMD -dc" '.lzo')
             ;;
         *gzip*)
-            specs=( "$GZIP_CMD -dc" '.gz' )
+            compression_specs=( "$GZIP_CMD -dc" '.gz' )
             ;;
         *XZ*)
-            specs=( "$XZ_CMD -dc" '.xz' )
+            compression_specs=( "$XZ_CMD -dc" '.xz' )
             ;;
         *Zip*)
-            specs=( "$UNZIP_CMD -p" '.zip' )
+            compression_specs=( "$UNZIP_CMD -p" '.zip' )
             ;;
         *Zstandard*)
-            specs=( "$ZSTD_CMD -dc" '.zst' )
+            compression_specs=( "$ZSTD_CMD -dc" '.zst' )
             ;;
         *'ISO 9660'*|*'DOS/MBR boot sector'*)
-            specs=( "$CAT_CMD" '' )
+            compression_specs=( "$CAT_CMD" '' )
             ;;
         *)
-            specs=( 'unknown' 'unknown' )
+            compression_specs=( 'unknown' 'unknown' )
             ;;
     esac
 
-    if test ."$specs" = .'unknown'; then
-        pr-error "${image}: Unrecognized image"
+    if test ."${compression_specs[0]}" = .'unknown'; then
+        pr-error "${image}: Unrecognized image."
         return 10
     fi
-
-    echo "${specs[$spec_no]}"
 }
 
 regex-escape ()
@@ -162,7 +159,7 @@ regex-escape ()
     local escaped=''
 
     if ! escaped=$($SED_CMD -e 's/[][/\*+.|$]/\\&/g'  <<<"$regex"); then
-        pr-error "${FUNCNAME[0]}: ${backing_image}: Escape failed"
+        pr-error "${FUNCNAME[0]}: ${backing_image}: Escape failed."
         return 1
     fi
 
@@ -172,11 +169,11 @@ regex-escape ()
 decompress-image ()
 {
     local compressed_image=$1
-    local image_cat=$2
+    local -n compression_specs=$2
     local -n tmpfile=$3
     local -n backing_images=$4
 
-    tmpfile=''
+    local tmpfile=''
 
     # Check $MOUNT_IMAGE_CACHE for existing decompressed image(s).
     if test -f "$MOUNT_IMAGE_CACHE"; then
@@ -199,18 +196,13 @@ decompress-image ()
         done
     fi
 
-    local extension=''
-    local decompressed_image=''
-
     if test ."$tmpfile" = .''; then
-        extension=$(compression-specs "$compressed_image" 1) || return $?
-        decompressed_image=${compressed_image%${extension}}
-        tmpfile=$($MKTEMP_CMD "${decompressed_image}.XXXXX") || return $?
+        tmpfile=$($MKTEMP_CMD "${compressed_image%${compression_specs[1]}}.XXXXX") || return $?
 
         trap '$RM_CMD -f "$tmpfile"' 0 1 2 15 RETURN
 
         pr-info "${script_name}: ${compressed_image}: Decompressing.  Please wait..."
-        $image_cat "$compressed_image" >"$tmpfile" || return $?
+        ${compression_specs[0]} "$compressed_image" >"$tmpfile" || return $?
 
         trap - 0 1 2 15 RETURN
     fi
@@ -240,39 +232,35 @@ loop-attach-image ()
             $SUDO_CMD $LOSETUP_CMD --sector-size 512  --nooverlap \
                       --find --show "$image"
          ); then
-        pr-error "${FUNCNAME[0]}: ${device}: Invalid loop device"
+        pr-error "${FUNCNAME[0]}: ${device}: Invalid loop device."
         return 20
     fi
 
     echo "$device"
 }
 
-attach-image ()
+maybe-decompress-image ()
 {
     local image=$1
 
-    image=$(resolve-existing "$image") || return $?
+    local -a specs=()
 
-    local image_cat=''
-    image_cat=$(compression-specs "$image") || return $?
+    get-compression-specs "$image" specs || return $?
 
-    if test ."$image_cat" != ."$CAT_CMD"; then
+    if test ."${specs[0]}" != ."$CAT_CMD"; then
         local -a decompressed_images=()
         local -a existing_images=()
-        local compressed_image=$image
+        local decompressed_image=''
 
-        image=''
-        decompress-image "$compressed_image" "$image_cat" image existing_images || return $?
+        decompress-image "$image" specs decompressed_image existing_images || return $?
         if (( ${#existing_images[*]} == 0 )); then
-            log-restore-method "$image" "${image_cat%% *}" "$compressed_image" || return $?
+            log-restore-method "$decompressed_image" "${specs[0]%% *}" "$image" || return $?
         fi
+
+        image=$decompressed_image
     fi
 
-    local device=''
-
-    device=$(loop-attach-image "$image") || return $?
-
-    echo $device
+    echo $image
 }
 
 next-free-path ()
@@ -305,13 +293,13 @@ mount-filesystem ()
     fi
 
     if test ."$mount_point" = .''; then
-        pr-error "${FUNCNAME[0]}: Create mount point failed"
+        pr-error "${FUNCNAME[0]}: Create mount point failed."
         return 1
     elif $FINDMNT_CMD "$mount_point" >/dev/null; then
-        pr-error "${FUNCNAME[0]}: ${mount_point}: Cannot overwrite"
+        pr-error "${FUNCNAME[0]}: ${mount_point}: Cannot overwrite."
         return 2
     elif ! $SUDO_CMD $INSTALL_CMD -d -m 0700 -o "$USER" "$mount_point"; then
-        pr-error "${FUNCNAME[0]}: ${mount_point}: Permission denied"
+        pr-error "${FUNCNAME[0]}: ${mount_point}: Permission denied."
         return 3
     fi
 
@@ -367,6 +355,7 @@ mount-device-partitions ()
     local -a partitions=()
 
     $SUDO_CMD $PARTPROBE_CMD "$device"
+    $SLEEP_CMD 1
     mapfile -t partitions < <(printf '%s\n' "${device}p"*)
 
     for partition in "${partitions[@]}"; do
@@ -374,7 +363,10 @@ mount-device-partitions ()
         local -a fstypes=()
         local fstype=''
 
-        mapfile -t fstypes < <($LSBLK_CMD -no FSTYPE "$partition")
+        mapfile -t fstypes < <(
+            $LSBLK_CMD -no FSTYPE "$partition" |
+                $SED_CMD -e '/^$/d'
+        )
 
         if (( ${#fstypes[*]} > 1 )); then
             # Previously attached LVM2 volume.
@@ -393,13 +385,13 @@ mount-device-partitions ()
                 ;;
             LVM2_member)
                 if ! mount_point=$(mount-lvm2 "$partition"); then
-                    pr-error "${FUNCNAME[0]}: ${partition}: LVM2 mount failed"
+                    pr-error "${FUNCNAME[0]}: ${partition}: LVM2 mount failed."
                     continue
                 fi
                 ;;
             *)
                 if ! mount_point=$(mount-filesystem "$partition"); then
-                    pr-error "${FUNCNAME[0]}: ${partition}: Mount failed"
+                    pr-error "${FUNCNAME[0]}: ${partition}: Mount failed."
                     continue
                 fi
                 ;;
@@ -416,7 +408,7 @@ get-mounted-device ()
     local device=''
 
     if ! device=$($FINDMNT_CMD -no SOURCE "$mount_point"); then
-        pr-error "${FUNCNAME[0]}: ${mount_point}: Invalid mount point"
+        pr-error "${FUNCNAME[0]}: ${mount_point}: Invalid mount point."
         return 40
     fi
 
@@ -430,7 +422,7 @@ get-backing-image ()
     local backing_image=''
 
     if ! backing_image=$($LOSETUP_CMD -nO BACK-FILE "$device"); then
-        pr-error "${FUNCNAME[0]}: ${device}: Invalid loop device"
+        pr-error "${FUNCNAME[0]}: ${device}: Invalid loop device."
         return 50
     fi
 
@@ -446,12 +438,12 @@ umount-filesystem ()
 
     for mount_point in "${mounts[@]}"; do
         if test ."$mount_point" = .''; then
-            pr-warn "${FUNCNAME[0]}: ${partition}: Empty mount point"
+            pr-warn "${FUNCNAME[0]}: ${partition}: Empty mount point."
         elif ! $SUDO_CMD $UMOUNT_CMD -f "$mount_point"; then
-            pr-error "${FUNCNAME[0]}: ${mount_point}: Umount failed"
+            pr-error "${FUNCNAME[0]}: ${mount_point}: Umount failed."
             return 61
         elif ! $SUDO_CMD $RMDIR_CMD "$mount_point"; then
-            pr-error "${FUNCNAME[0]}: ${mount_point}: Permission denied"
+            pr-error "${FUNCNAME[0]}: ${mount_point}: Permission denied."
             return 62
         fi
     done
@@ -553,7 +545,7 @@ detach-device ()
 
     if test -b "$device"; then
         if ! $SUDO_CMD $LOSETUP_CMD -d "$device" &>/dev/null; then
-            pr-error "${FUNCNAME[0]}: ${device}: Loop detach failed"
+            pr-error "${FUNCNAME[0]}: ${device}: Loop detach failed."
             return 30
         fi
     fi
@@ -609,19 +601,12 @@ umount-image ()
 {
     local image=$1
 
-    image=$(resolve-existing "$image") || return $?
+    local -a specs=()
 
-    local image_cat=''
+    get-compression-specs "$image" specs || return $?
 
-    image_cat=$(compression-specs "$image") || return $?
-
-    local compressed_image=''
-
-    if test ."$image_cat" != ."$CAT_CMD"; then
-        compressed_image=$image
-
-        extension=$(compression-specs "$compressed_image" 1) || return $?
-        image=${compressed_image%${extension}}
+    if test ."${specs[0]}" != ."$CAT_CMD"; then
+        image=${image%${specs[1]}}
     fi
 
     local device=''
@@ -691,11 +676,14 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
             $INSTALL_CMD -d -m 0750 -o root -g root "$MOUNT_IMAGE_BASEDIR" || exit 1
 
             for image in "$@"; do
-                if test ! -f "$image"; then
-                    pr-error "${script_name}: ${image}: Invalid image"
+                if ! image=$(resolve-existing "$image"); then
+                    pr-error "${script_name}: ${image}: No such file or directory."
                     continue
-                elif ! device=$(attach-image "$image"); then
-                    pr-error "${script_name}: ${image}: Loop attach failed"
+                elif ! image=$(maybe-decompress-image "$image"); then
+                    pr-error "${script_name}: ${image}: Decompress failed."
+                    continue
+                elif ! device=$(loop-attach-image "$image"); then
+                    pr-error "${script_name}: ${image}: Loop attach failed."
                     continue
                 fi
                 mount-device-partitions "$device"
@@ -711,12 +699,15 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
             fi
 
             for path in "$@"; do
-                if test -f "$path"; then
+                if ! path=$(resolve-existing "$path"); then
+                    pr-error "${script_name}: ${path}: No such file or directory."
+                    continue
+                elif test -f "$path"; then
                     backing_image=$(umount-image "$path") || exit $?
                 elif test -d "$path"; then
                     backing_image=$(umount-image-by-mount-point "$path") || exit $?
                 else
-                    pr-error "${script_name}: ${path}: No such file or directory"
+                    pr-error "${script_name}: ${path}: Unsupported file type."
                     continue
                 fi
 

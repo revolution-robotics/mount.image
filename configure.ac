@@ -83,6 +83,7 @@ AC_PATH_PROGS([RM_CMD],         [grm rm],             [], [${OPT_PREFIX}${PATH}]
 AC_PATH_PROGS([RMDIR_CMD],      [grmdir rmdir],       [], [${OPT_PREFIX}${PATH}])
 AC_PATH_PROGS([SED_CMD],        [gsed sed],           [], [${OPT_PREFIX}${PATH}])
 AC_PATH_PROGS([SEQ_CMD],        [gseq seq],           [], [${OPT_PREFIX}${PATH}])
+AC_PATH_PROGS([SLEEP_CMD],      [gsleep sleep],       [], [${OPT_PREFIX}${PATH}])
 
 AC_PATH_PROG([SUDO_CMD],        [sudo],               [], [${OPT_PREFIX}${PATH}])
 
