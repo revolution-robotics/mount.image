@@ -38,10 +38,7 @@ AC_SUBST([OPT_PATHS], ["$OPT_PATHS"])
 OPT_PREFIX=${OPT_PREFIX:+"${OPT_PREFIX}${PATH_SEPARATOR}"}
 
 # Checks for programs.
-AC_PATH_PROGS([AWK_CMD],        [gawk awk],           [], [${OPT_PREFIX}${PATH}])
-
 AC_PATH_PROG([BASH_CMD],        [bash],               [], [${OPT_PREFIX}${PATH}])
-AC_PATH_PROG([BLKID_CMD],       [blkid],              [], [${OPT_PREFIX}${PATH}])
 AC_PATH_PROG([BZIP2_CMD],       [bzip2],              [], [${OPT_PREFIX}${PATH}])
 
 AC_PATH_PROGS([CAT_CMD],        [gcat cat],           [], [${OPT_PREFIX}${PATH}])
@@ -61,9 +58,6 @@ AC_PATH_PROGS([INSTALL_CMD],    [ginstall install],   [], [${OPT_PREFIX}${PATH}]
 AC_PATH_PROG([JQ_CMD],          [jq])
 AC_PATH_PROG([KPARTX_CMD],      [kpartx])
 AC_PATH_PROG([LOSETUP_CMD],     [losetup])
-
-AC_PATH_PROGS([LS_CMD],         [gls ls],             [], [${OPT_PREFIX}${PATH}])
-
 AC_PATH_PROG([LSBLK_CMD],       [lsblk])
 AC_PATH_PROG([LVS_CMD],         [lvs])
 AC_PATH_PROG([LZIP_CMD],        [lzip],               [], [${OPT_PREFIX}${PATH}])
