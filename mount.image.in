@@ -175,25 +175,27 @@ decompress-image ()
 
     local tmpfile=''
 
-    # Check $MOUNT_IMAGE_CACHE for existing decompressed image(s).
-    if test -f "$MOUNT_IMAGE_CACHE"; then
-        local image_escaped=''
+    if test ."${parameters[shared-cache]}" = .'true'; then
+        # Check $MOUNT_IMAGE_CACHE for existing decompressed image(s).
+        if test -f "$MOUNT_IMAGE_CACHE"; then
+            local image_escaped=''
 
-        image_escaped=$(regex-escape "$compressed_image") || return $?
-        mapfile -t backing_images < <(
-            $SUDO_CMD $SED_CMD -En -e '/[[:space:]]+'"$image_escaped"'$/s/[[:space:]]+.*$//p' "$MOUNT_IMAGE_CACHE"
-        )
+            image_escaped=$(regex-escape "$compressed_image") || return $?
+            mapfile -t backing_images < <(
+                $SUDO_CMD $SED_CMD -En -e '/[[:space:]]+'"$image_escaped"'$/s/[[:space:]]+.*$//p' "$MOUNT_IMAGE_CACHE"
+            )
 
-        for i in $($SEQ_CMD $(( ${#backing_images[*]} - 1 )) -1 0); do
-            if test -f "${backing_images[i]}"; then
-                tmpfile=${backing_images[i]}
-                break
-            else
-                # Remove stale image from cache.
-                image_escaped=$(regex-escape "${backing_image[i]}") || return $?
-                $SUDO_CMD $SED_CMD -Ei -e '/^'"$image_escaped"'[[:space:]]+/d' "$MOUNT_IMAGE_CACHE"
-            fi
-        done
+            for i in $($SEQ_CMD $(( ${#backing_images[*]} - 1 )) -1 0); do
+                if test -f "${backing_images[i]}"; then
+                    tmpfile=${backing_images[i]}
+                    break
+                else
+                    # Remove stale image from cache.
+                    image_escaped=$(regex-escape "${backing_image[i]}") || return $?
+                    $SUDO_CMD $SED_CMD -Ei -e '/^'"$image_escaped"'[[:space:]]+/d' "$MOUNT_IMAGE_CACHE"
+                fi
+            done
+        fi
     fi
 
     if test ."$tmpfile" = .''; then
@@ -227,13 +229,26 @@ loop-attach-image ()
     local image=$1
 
     local device=''
+    local attached_device=''
 
-    if ! device=$(
+    if ! attached_device=$(
+        $LOSETUP_CMD -lJ |
+            $JQ_CMD -r '.loopdevices |
+                .[] |
+                select( ."back-file" == "'"$image"'" ) |
+                .name'
+         ); then
+        pr-error "${FUNCNAME[0]}: Loop-device query failed."
+        return 20
+    elif test ."${parameters[shared-cache]}" != .'true' -a ."$attached_device" != .''; then
+        pr-error "${FUNCNAME[0]}: ${attached_device}: Image already attached to loop device."
+        return 21
+    elif ! device=$(
             $SUDO_CMD $LOSETUP_CMD --sector-size 512  --nooverlap \
                       --find --show "$image"
          ); then
-        pr-error "${FUNCNAME[0]}: ${device}: Invalid loop device."
-        return 20
+        pr-error "${FUNCNAME[0]}: ${image}: Loop-device attach failed."
+        return 22
     fi
 
     echo "$device"
@@ -642,7 +657,7 @@ s;[[:space:]]+;\\
 -,.d
 wq
 EOF
-)
+    )
 
     if (( ${#restore_parameters[*]} > 0 )); then
         pr-info "${script_name}: ${restore_parameters[1]%.*}: Compressing. Please wait..."
@@ -659,9 +674,11 @@ EOF
 }
 
 if test ."$0" = ."${BASH_SOURCE[0]}"; then
-    declare script_name=${0##*/}
-
     shopt -s extglob
+
+    declare script_name=${0##*/}
+    declare -A parameters=( [shared-cache]=false )
+    declare -i exit_status=0
 
     case "$0" in
         */mount.image)
@@ -678,15 +695,18 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
             for image in "$@"; do
                 if ! image=$(resolve-existing "$image"); then
                     pr-error "${script_name}: ${image}: No such file or directory."
+                    (( ++exit_status ))
                     continue
                 elif ! image=$(maybe-decompress-image "$image"); then
                     pr-error "${script_name}: ${image}: Decompress failed."
+                    (( ++exit_status ))
                     continue
                 elif ! device=$(loop-attach-image "$image"); then
                     pr-error "${script_name}: ${image}: Loop attach failed."
+                    (( ++exit_status ))
                     continue
                 fi
-                mount-device-partitions "$device"
+                mount-device-partitions "$device" || exit $?
             done
             ;;
         */umount.image)
@@ -701,6 +721,7 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
             for path in "$@"; do
                 if ! path=$(resolve-existing "$path"); then
                     pr-error "${script_name}: ${path}: No such file or directory."
+                    (( ++exit_status ))
                     continue
                 elif test -f "$path"; then
                     backing_image=$(umount-image "$path") || exit $?
@@ -708,19 +729,24 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
                     backing_image=$(umount-image-by-mount-point "$path") || exit $?
                 else
                     pr-error "${script_name}: ${path}: Unsupported file type."
+                    (( ++exit_status ))
                     continue
                 fi
 
                 if test -f "$MOUNT_IMAGE_CACHE"; then
                     declare backing_image_escaped=''
 
-                    backing_image_escaped=$(regex-escape "$backing_image") || continue
+                    if ! backing_image_escaped=$(regex-escape "$backing_image"); then
+                        (( ++exit_status ))
+                        continue
+                    fi
 
                     if $GREP_CMD -Eq '^'"$backing_image_escaped"'[[:space:]]+' "$MOUNT_IMAGE_CACHE" 2>/dev/null; then
-                        maybe-compress-image "$backing_image"
+                        maybe-compress-image "$backing_image" || exit $?
                     fi
                 fi
             done
             ;;
     esac
+    exit $exit_status
 fi
