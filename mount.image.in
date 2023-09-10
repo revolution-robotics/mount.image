@@ -173,8 +173,6 @@ decompress-image ()
     local -n tmpfile=$3
     local -n backing_images=$4
 
-    local tmpfile=''
-
     if test ."${parameters[shared-cache]}" = .'true'; then
         # Check $MOUNT_IMAGE_CACHE for existing decompressed image(s).
         if test -f "$MOUNT_IMAGE_CACHE"; then
