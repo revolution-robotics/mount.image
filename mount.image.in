@@ -690,7 +690,7 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
                 exit 1
             fi
 
-            $INSTALL_CMD -d -m 0750 -o root -g root "$MOUNT_IMAGE_BASEDIR" || exit 1
+            $SUDO_CMD $INSTALL_CMD -d -m 0755 -o root -g root "$MOUNT_IMAGE_BASEDIR" || exit 1
 
             for image in "$@"; do
                 if ! image=$(resolve-existing "$image"); then
