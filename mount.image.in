@@ -410,7 +410,7 @@ mount-device-partitions ()
                 ;;
         esac
 
-        pr-info "$mount_point"
+        echo "$mount_point"
     done
 }
 
