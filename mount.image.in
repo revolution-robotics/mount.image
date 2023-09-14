@@ -81,7 +81,7 @@ pr-error ()
 resolve-existing ()
 {
     if $READLINK_CMD --version 2>&1 | $GREP_CMD -q 'coreutils'; then
-        $READLINK_CMD -e "$@"
+        $READLINK_CMD -e -- "$@"
     else
         $READLINK_CMD -f N "$@"
     fi
@@ -180,7 +180,9 @@ decompress-image ()
 
             image_escaped=$(regex-escape "$compressed_image") || return $?
             mapfile -t backing_images < <(
-                $SUDO_CMD $SED_CMD -En -e '/[[:space:]]+'"$image_escaped"'$/s/[[:space:]]+.*$//p' "$MOUNT_IMAGE_CACHE"
+                $SUDO_CMD $SED_CMD -En \
+                          -e '/[[:space:]]+'"$image_escaped"'$/s/[[:space:]]+.*$//p' \
+                          "$MOUNT_IMAGE_CACHE"
             )
 
             for i in $($SEQ_CMD $(( ${#backing_images[*]} - 1 )) -1 0); do
@@ -190,7 +192,8 @@ decompress-image ()
                 else
                     # Remove stale image from cache.
                     image_escaped=$(regex-escape "${backing_image[i]}") || return $?
-                    $SUDO_CMD $SED_CMD -Ei -e '/^'"$image_escaped"'[[:space:]]+/d' "$MOUNT_IMAGE_CACHE"
+                    $SUDO_CMD $SED_CMD -Ei -e '/^'"$image_escaped"'[[:space:]]+/d' \
+                              "$MOUNT_IMAGE_CACHE" || return $?
                 fi
             done
         fi
@@ -672,21 +675,22 @@ EOF
 }
 
 if test ."$0" = ."${BASH_SOURCE[0]}"; then
+    set -o pipefail
     shopt -s extglob
 
     declare script_name=${0##*/}
     declare -A parameters=( [shared-cache]=false )
     declare -i exit_status=0
 
+    if (( $# == 0 )) || [[ ."$1" =~ ^\.-h|--help ]]; then
+        pr-info "Usage: ${script_name} disk-image [...]"
+        exit
+    fi
+
     case "$0" in
         */mount.image)
             declare image=''
             declare device=''
-
-            if (( $# == 0 )); then
-                pr-info "Usage: ${script_name} disk-image [...]"
-                exit 1
-            fi
 
             $SUDO_CMD $INSTALL_CMD -d -m 0755 -o root -g root "$MOUNT_IMAGE_BASEDIR" || exit 1
 
@@ -710,11 +714,6 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
         */umount.image)
             declare path=''
             declare backing_image=''
-
-            if (( $# == 0 )); then
-                pr-info "Usage: ${script_name} disk-image | mount-point [...]"
-                exit 1
-            fi
 
             for path in "$@"; do
                 if ! path=$(resolve-existing "$path"); then
