@@ -22,6 +22,7 @@
 : ${CAT_CMD:='@CAT_CMD@'}
 : ${DMSETUP_CMD:='@DMSETUP_CMD@'}
 : ${ED_CMD:='@ED_CMD@'}
+: ${FILE_CMD:='@FILE_CMD@'}
 : ${FINDMNT_CMD:='@FINDMNT_CMD@'}
 : ${FLOCK_CMD:='@FLOCK_CMD@'}
 : ${GETOPT_CMD:='@GETOPT_CMD@'}

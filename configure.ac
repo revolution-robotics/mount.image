@@ -45,6 +45,9 @@ AC_PATH_PROGS([CAT_CMD],        [gcat cat],           [], [${OPT_PREFIX}${PATH}]
 
 AC_PATH_PROG([DMSETUP_CMD],     [dmsetup],            [], [${OPT_PREFIX}${PATH}])
 AC_PATH_PROG([ED_CMD],          [ed],                 [], [${LOCAL_PREFIX}${PATH}])
+
+AC_PATH_PROGS([FILE_CMD],       [gfile file],         [], [${LOCAL_PREFIX}${PATH}])
+
 AC_PATH_PROG([FINDMNT_CMD],     [findmnt])
 AC_PATH_PROG([FLOCK_CMD],       [flock],              [], [${OPT_PREFIX}${PATH}])
 AC_PATH_PROG([GETOPT_CMD],      [getopt],             [], [${OPT_PREFIX}${PATH}])
