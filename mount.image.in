@@ -48,6 +48,7 @@
 : ${SEQ_CMD:='@SEQ_CMD@'}
 : ${SLEEP_CMD:='@SLEEP_CMD@'}
 : ${SUDO_CMD:='@SUDO_CMD@'}
+: ${SYNC_CMD:='/bin/sync'}
 : ${TR_CMD:='@TR_CMD@'}
 : ${UMOUNT_CMD:='@UMOUNT_CMD@'}
 : ${UNZIP_CMD:='@UNZIP_CMD@'}
@@ -701,11 +702,11 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
         pr-info "Usage: ${script_name} disk-image [...]"
         exit
     elif [[ ."$1" =~ ^\.--no-decompress ]]; then
-        shift
         parameters[no-decompress]=true
-    elif [[ ."$1" =~ ^\.--no-compress ]]; then
         shift
+    elif [[ ."$1" =~ ^\.--no-compress ]]; then
         parameters[no-compress]=true
+        shift
     fi
 
     case "$0" in
@@ -735,6 +736,8 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
         */umount.image)
             declare path=''
             declare backing_image=''
+
+            $SYNC_CMD; $SYNC_CMD; $SLEEP_CMD 1
 
             for path in "$@"; do
                 if ! path=$(resolve-existing "$path"); then
