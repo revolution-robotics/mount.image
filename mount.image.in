@@ -173,8 +173,11 @@ decompress-image ()
     local -n compression_specs=$2
     local -n tmpfile=$3
     local -n backing_images=$4
+    local -n params=$5
 
-    if test ."${parameters[shared-cache]}" = .'true'; then
+    if ${params[no-decompress]} && test -f "${compressed_image%${compression_specs[1]}}"; then
+        tmpfile=${compressed_image%${compression_specs[1]}}
+    elif test ."${params[shared-cache]}" = .'true'; then
         # Check $MOUNT_IMAGE_CACHE for existing decompressed image(s).
         if test -f "$MOUNT_IMAGE_CACHE"; then
             local image_escaped=''
@@ -259,6 +262,8 @@ loop-attach-image ()
 maybe-decompress-image ()
 {
     local image=$1
+    local no_decompress=$2
+    local -n _parameters=$3
 
     local -a specs=()
 
@@ -269,7 +274,7 @@ maybe-decompress-image ()
         local -a existing_images=()
         local decompressed_image=''
 
-        decompress-image "$image" specs decompressed_image existing_images || return $?
+        decompress-image "$image" specs decompressed_image existing_images _parameters || return $?
         if (( ${#existing_images[*]} == 0 )); then
             log-restore-method "$decompressed_image" "${specs[0]%% *}" "$image" || return $?
         fi
@@ -642,6 +647,11 @@ umount-image ()
 maybe-compress-image ()
 {
     local backing_image=$1
+    local -n _parameters=$2
+
+    if ${_parameters[no-compress]}; then
+        return 0
+    fi
 
     local -a restore_parameters=()
     local backing_image_escaped=''
@@ -680,12 +690,22 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
     shopt -s extglob
 
     declare script_name=${0##*/}
-    declare -A parameters=( [shared-cache]=false )
+    declare -A parameters=(
+        [shared-cache]=false
+        [no-decompress]=false
+        [no-compress]=false
+    )
     declare -i exit_status=0
 
     if (( $# == 0 )) || [[ ."$1" =~ ^\.-h|--help ]]; then
         pr-info "Usage: ${script_name} disk-image [...]"
         exit
+    elif [[ ."$1" =~ ^\.--no-decompress ]]; then
+        shift
+        parameters[no-decompress]=true
+    elif [[ ."$1" =~ ^\.--no-compress ]]; then
+        shift
+        parameters[no-compress]=true
     fi
 
     case "$0" in
@@ -700,7 +720,7 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
                     pr-error "${script_name}: ${image}: No such file or directory."
                     (( ++exit_status ))
                     continue
-                elif ! image=$(maybe-decompress-image "$image"); then
+                elif ! image=$(maybe-decompress-image "$image" "$no_decompress" parameters); then
                     pr-error "${script_name}: ${image}: Decompress failed."
                     (( ++exit_status ))
                     continue
@@ -740,7 +760,7 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
                     fi
 
                     if $GREP_CMD -Eq '^'"$backing_image_escaped"'[[:space:]]+' "$MOUNT_IMAGE_CACHE" 2>/dev/null; then
-                        maybe-compress-image "$backing_image" || exit $?
+                        maybe-compress-image "$backing_image" parameters || exit $?
                     fi
                 fi
             done
