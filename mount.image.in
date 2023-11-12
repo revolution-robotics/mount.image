@@ -79,6 +79,16 @@ pr-error ()
     echo "Error: $@" >&2
 }
 
+usage ()
+{
+    pr-info "Usage: ${script_name} [OPTION] DISK-IMAGE [...]
+Options:
+    --help, -h            Print help, then exit.
+    --no-compress, -c     Don't compress unmounted image.
+    --no-decompress, -d   Use existing decompressed image, if any.
+    --tmpdir, -t DIR      Write to DIR instead of DISK-IMAGE's directory."
+}
+
 # OS-agnstoic readlink for existent files/directories.
 resolve-existing ()
 {
@@ -686,6 +696,70 @@ EOF
     fi
 }
 
+parse-command-line ()
+{
+    local -n params=$1
+    local -n pathnames=$2
+
+    local args
+    local -r shortopts=hcds:t:
+    local -r longopts=help,no-compress,no-decompress,shared-cache:,tmpdir:
+
+    shift 2
+    args=$(
+        $GETOPT_CMD --shell bash --options "$shortopts"  \
+                --longoptions "$longopts" --name "$script_name" -- "$@"
+        ) || return 1
+
+    eval set -- "$args"
+
+    while true; do
+        case "$1" in
+            --help|-h)
+                usage
+                exit
+                ;;
+            --no-compress|-c)
+                params[no-compress]=true
+                ;;
+            --no-decompress|-d)
+                params[no-decompress]=true
+                ;;
+            --shared-cache|-s)
+                case "$2" in
+                    1|[yY]*|[tT]*)
+                        params[shared-cache]=true
+                        ;;
+                    *)
+                        params[shared-cache]=true
+                        ;;
+                esac
+                shift
+                ;;
+            --tmpdir|-t)
+                params[tmpdir]=$2
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                usage
+                return 1
+                ;;
+        esac
+        shift
+    done
+
+    if (( $# == 0 )); then
+        usage
+        return 1
+    fi
+
+    pathnames=( "$@" )
+}
+
 if test ."$0" = ."${BASH_SOURCE[0]}"; then
     set -o pipefail
     shopt -s extglob
@@ -696,27 +770,19 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
         [no-decompress]=false
         [no-compress]=false
     )
+    declare -a paths=()
     declare -i exit_status=0
 
-    if (( $# == 0 )) || [[ ."$1" =~ ^\.-h|--help ]]; then
-        pr-info "Usage: ${script_name} disk-image [...]"
-        exit
-    elif [[ ."$1" =~ ^\.--no-decompress ]]; then
-        parameters[no-decompress]=true
-        shift
-    elif [[ ."$1" =~ ^\.--no-compress ]]; then
-        parameters[no-compress]=true
-        shift
-    fi
+    parse-command-line parameters paths "$@"
 
-    case "$0" in
-        */mount.image)
+    case "$script_name" in
+        mount.image)
             declare image=''
             declare device=''
 
             $SUDO_CMD $INSTALL_CMD -d -m 0755 -o root -g root "$MOUNT_IMAGE_BASEDIR" || exit 1
 
-            for image in "$@"; do
+            for image in "${paths[@]}"; do
                 if ! image=$(resolve-existing "$image"); then
                     pr-error "${script_name}: ${image}: No such file or directory."
                     (( ++exit_status ))
@@ -733,13 +799,13 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
                 mount-device-partitions "$device" || exit $?
             done
             ;;
-        */umount.image)
+        umount.image)
             declare path=''
             declare backing_image=''
 
             $SYNC_CMD; $SYNC_CMD; $SLEEP_CMD 1
 
-            for path in "$@"; do
+            for path in "${paths[@]}"; do
                 if ! path=$(resolve-existing "$path"); then
                     pr-error "${script_name}: ${path}: No such file or directory."
                     (( ++exit_status ))
