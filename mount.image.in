@@ -2,7 +2,7 @@
 #
 # @(#) mount.image
 #
-# Copyright © 2023 Revolution Robotics, Inc.
+# Copyright © 2024 Revolution Robotics, Inc.
 #
 # This script mounts the partitions of a given (possibly compressed)
 # disk image on mount points of the form:
@@ -84,8 +84,9 @@ usage ()
     pr-info "Usage: ${script_name} [OPTION] DISK-IMAGE [...]
 Options:
     --help, -h            Print help, then exit.
-    --no-compress, -c     Don't compress unmounted image.
+    --no-compress, -c     Don't compress image upon unmounting it.
     --no-decompress, -d   Use existing decompressed image, if any.
+    --options, -o OPTS    Mount image with comma-separated options OPTS.
     --tmpdir, -t DIR      Write to DIR instead of DISK-IMAGE's directory."
 }
 
@@ -182,13 +183,14 @@ decompress-image ()
 {
     local compressed_image=$1
     local -n compression_specs=$2
-    local -n tmpfile=$3
+    local -n _decompressed_image=$3
     local -n backing_images=$4
-    local -n params=$5
+    local -n _params=$5
 
-    if ${params[no-decompress]} && test -f "${compressed_image%${compression_specs[1]}}"; then
-        tmpfile=${compressed_image%${compression_specs[1]}}
-    elif test ."${params[shared-cache]}" = .'true'; then
+    if ! ${_params[decompress]} \
+            && test -f "${compressed_image%${compression_specs[1]}}"; then
+        _decompressed_image=${compressed_image%${compression_specs[1]}}
+    elif test ."${_params[shared-cache]}" = .'true'; then
         # Check $MOUNT_IMAGE_CACHE for existing decompressed image(s).
         if test -f "$MOUNT_IMAGE_CACHE"; then
             local image_escaped=''
@@ -202,7 +204,7 @@ decompress-image ()
 
             for i in $($SEQ_CMD $(( ${#backing_images[*]} - 1 )) -1 0); do
                 if test -f "${backing_images[i]}"; then
-                    tmpfile=${backing_images[i]}
+                    _decompressed_image=${backing_images[i]}
                     break
                 else
                     # Remove stale image from cache.
@@ -214,13 +216,31 @@ decompress-image ()
         fi
     fi
 
-    if test ."$tmpfile" = .''; then
-        tmpfile=$($MKTEMP_CMD "${compressed_image%${compression_specs[1]}}.XXXXX") || return $?
+    if test ."$_decompressed_image" = .''; then
+        local decompressed_name=${compressed_image%${compression_specs[1]}}
 
-        trap '$RM_CMD -f "$tmpfile"' 0 1 2 15 RETURN
+        if test -d "${_params[tmpdir]}"; then
+            _decompressed_image=$(
+                $MKTEMP_CMD "${_params[tmpdir]}/${decompressed_name##*/}.XXXXX"
+                   ) || return $?
+        else
+            _decompressed_image=$(
+                $MKTEMP_CMD "${decompressed_name}.XXXXX"
+                   ) || return $?
+        fi
+
+        trap '$RM_CMD -f "$_decompressed_image"; exit 1' 0 1 2 15 RETURN
 
         pr-info "${script_name}: ${compressed_image}: Decompressing.  Please wait..."
-        ${compression_specs[0]} "$compressed_image" >"$tmpfile" || return $?
+
+        case "${compression_specs[0]}" in
+            *zstd*)
+                ${compression_specs[0]} -T0 "$compressed_image" >"$_decompressed_image" || return $?
+                ;;
+            *)
+                ${compression_specs[0]} "$compressed_image" >"$_decompressed_image" || return $?
+                ;;
+        esac
 
         trap - 0 1 2 15 RETURN
     fi
@@ -281,11 +301,11 @@ maybe-decompress-image ()
     get-compression-specs "$image" specs || return $?
 
     if test ."${specs[0]}" != ."$CAT_CMD"; then
-        local -a decompressed_images=()
         local -a existing_images=()
         local decompressed_image=''
 
         decompress-image "$image" specs decompressed_image existing_images _parameters || return $?
+
         if (( ${#existing_images[*]} == 0 )); then
             log-restore-method "$decompressed_image" "${specs[0]%% *}" "$image" || return $?
         fi
@@ -293,7 +313,7 @@ maybe-decompress-image ()
         image=$decompressed_image
     fi
 
-    echo $image
+    echo "$image"
 }
 
 next-free-path ()
@@ -336,7 +356,11 @@ mount-filesystem ()
         return 3
     fi
 
-    $SUDO_CMD $MOUNT_CMD "$device" "$mount_point"
+    if test ."${_parameters[options]}" = .''; then
+        $SUDO_CMD $MOUNT_CMD "$device" "$mount_point"
+    else
+        $SUDO_CMD $MOUNT_CMD -o "${_parameters[options]}" "$device" "$mount_point"
+    fi
 
     echo "$mount_point"
 }
@@ -589,17 +613,15 @@ umount-image-by-mount-point ()
     local mount_point=$1
 
     local device=''
+    local base_device=''
     local backing_image=''
 
     device=$(get-mounted-device "$mount_point") || return $?
-
-    local base_device=''
-
     base_device=${device%p+([0-9])}
-
     backing_image=$(get-backing-image "$base_device") || return $?
     umount-device-partitions "$base_device" || return $?
     detach-device "$base_device" || return $?
+
     echo "$backing_image"
 }
 
@@ -615,7 +637,7 @@ get-image-device ()
                 .[] |
                 select(
                     ."back-file" |
-                     startswith("'"$image"'")
+                     test("'"${image##*/}"'")
                 ) | .name'
         )
 
@@ -635,20 +657,16 @@ umount-image ()
     local image=$1
 
     local -a specs=()
+    local device=''
+    local backing_image=''
 
     get-compression-specs "$image" specs || return $?
-
     if test ."${specs[0]}" != ."$CAT_CMD"; then
         image=${image%${specs[1]}}
     fi
 
-    local device=''
-
     device=$(get-image-device "$image") || return $?
     umount-device-partitions "$device" || return $?
-
-    local backing_image=''
-
     backing_image=$(get-backing-image "$device") || return $?
     detach-device "$device" || return $?
 
@@ -658,11 +676,8 @@ umount-image ()
 maybe-compress-image ()
 {
     local backing_image=$1
-    local -n _parameters=$2
-
-    if ${_parameters[no-compress]}; then
-        return 0
-    fi
+    local pathname=$2
+    local -n _parameters=$3
 
     local -a restore_parameters=()
     local backing_image_escaped=''
@@ -677,14 +692,32 @@ s;;;\\
 s;[[:space:]]+;\\
 ;
 -,.p
--,.d
-wq
+Q
 EOF
     )
 
     if (( ${#restore_parameters[*]} > 0 )); then
+        if ${_parameters[shared-cache]}; then
+            return 0
+        elif test ! -w "${restore_parameters[1]}"; then
+            $RM_CMD -f "$backing_image" || return $?
+            $SUDO_CMD $ED_CMD -Es "$MOUNT_IMAGE_CACHE" <<EOF
+/^$backing_image_escaped[[:space:]]+/d
+wq
+EOF
+            return 0
+        fi
+
         pr-info "${script_name}: ${restore_parameters[1]%.*}: Compressing. Please wait..."
-        ${restore_parameters[0]} "$backing_image" || return $?
+
+        case "${restore_parameters[0]}" in
+            *zstd*)
+                ${restore_parameters[0]} -T0 "$backing_image" || return $?
+                ;;
+            *)
+                ${restore_parameters[0]} "$backing_image" || return $?
+                ;;
+        esac
 
         local extension=.${restore_parameters[1]##*.}
 
@@ -692,7 +725,12 @@ EOF
         $MV_CMD -f "${backing_image}${extension}" "${restore_parameters[1]}" || return $?
 
         # zstd, e.g., does not remove original.
-        $RM_CMD -f "$backing_image"
+        $RM_CMD -f "$backing_image" || return $?
+
+        $SUDO_CMD $ED_CMD -Es "$MOUNT_IMAGE_CACHE" <<EOF
+/^$backing_image_escaped[[:space:]]+/d
+wq
+EOF
     fi
 }
 
@@ -702,8 +740,8 @@ parse-command-line ()
     local -n pathnames=$2
 
     local args
-    local -r shortopts=hcds:t:
-    local -r longopts=help,no-compress,no-decompress,shared-cache:,tmpdir:
+    local -r shortopts=hcdo:st:
+    local -r longopts=help,no-compress,no-decompress,options:,shared-cache,tmpdir:
 
     shift 2
     args=$(
@@ -720,21 +758,27 @@ parse-command-line ()
                 exit
                 ;;
             --no-compress|-c)
-                params[no-compress]=true
+                params[compress]=false
                 ;;
             --no-decompress|-d)
-                params[no-decompress]=true
+                params[decompress]=false
                 ;;
-            --shared-cache|-s)
+            --options|-o)
                 case "$2" in
-                    1|[yY]*|[tT]*)
-                        params[shared-cache]=true
-                        ;;
-                    *)
-                        params[shared-cache]=true
+                    ro|ro,*|*,ro|*,ro,*)
+                        if test ."${params[tmpdir]}" = .''; then
+                            params[tmpdir]=/tmp
+                        fi
+
+                        params[compress]=false
                         ;;
                 esac
+
+                params[options]=$2
                 shift
+                ;;
+            --shared-cache|-s)
+                params[shared-cache]=true
                 ;;
             --tmpdir|-t)
                 params[tmpdir]=$2
@@ -766,9 +810,10 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
 
     declare script_name=${0##*/}
     declare -A parameters=(
+        [decompress]=true
+        [compress]=true
         [shared-cache]=false
-        [no-decompress]=false
-        [no-compress]=false
+        [tmpdir]=''
     )
     declare -a paths=()
     declare -i exit_status=0
@@ -787,6 +832,10 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
                     pr-error "${script_name}: ${image}: No such file or directory."
                     (( ++exit_status ))
                     continue
+                elif test ! -w "$image" && ${parameters[compress]}; then
+                    pr-error "${script_name}: ${image}: Not writable; Maybe use \`--options ro'."
+                    (( ++exit_status ))
+                    continue
                 elif ! image=$(maybe-decompress-image "$image" "$no_decompress" parameters); then
                     pr-error "${script_name}: ${image}: Decompress failed."
                     (( ++exit_status ))
@@ -796,6 +845,7 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
                     (( ++exit_status ))
                     continue
                 fi
+
                 mount-device-partitions "$device" || exit $?
             done
             ;;
@@ -829,11 +879,12 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
                     fi
 
                     if $GREP_CMD -Eq '^'"$backing_image_escaped"'[[:space:]]+' "$MOUNT_IMAGE_CACHE" 2>/dev/null; then
-                        maybe-compress-image "$backing_image" parameters || exit $?
+                        maybe-compress-image "$backing_image" "$path" parameters || exit $?
                     fi
                 fi
             done
             ;;
     esac
+
     exit $exit_status
 fi
