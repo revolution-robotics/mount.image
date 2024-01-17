@@ -149,7 +149,7 @@ get-compression-specs ()
             compression_specs=( "$UNZIP_CMD -p" '.zip' )
             ;;
         *Zstandard*)
-            compression_specs=( "$ZSTD_CMD -dc" '.zst' )
+            compression_specs=( "$ZSTD_CMD -T0 -dc" '.zst' )
             ;;
         *'ISO 9660'*|*'DOS/MBR boot sector'*)
             compression_specs=( "$CAT_CMD" '' )
@@ -165,18 +165,19 @@ get-compression-specs ()
     fi
 }
 
-regex-escape ()
+extended-regex-escape ()
 {
     local regex=$1
 
-    local escaped=''
+    local regex_escaped=''
 
-    if ! escaped=$($SED_CMD -e 's/[][/\*+.|$]/\\&/g'  <<<"$regex"); then
+    # Escape Extended Regular Expression special characers.
+    if ! regex_escaped=$($SED_CMD -e 's/[][(){}/\*+.|$]/\\&/g'  <<<"$regex"); then
         pr-error "${FUNCNAME[0]}: ${backing_image}: Escape failed."
         return 1
     fi
 
-    echo "$escaped"
+    echo -E "$regex_escaped"
 }
 
 decompress-image ()
@@ -195,10 +196,10 @@ decompress-image ()
         if test -f "$MOUNT_IMAGE_CACHE"; then
             local image_escaped=''
 
-            image_escaped=$(regex-escape "$compressed_image") || return $?
+            image_escaped=$(extended-regex-escape "$compressed_image") || return $?
             mapfile -t backing_images < <(
                 $SUDO_CMD $SED_CMD -En \
-                          -e '/[[:space:]]+'"$image_escaped"'$/s/[[:space:]]+.*$//p' \
+                          -e '/⏹'"$image_escaped"'$/s/⏹.*$//p' \
                           "$MOUNT_IMAGE_CACHE"
             )
 
@@ -208,8 +209,8 @@ decompress-image ()
                     break
                 else
                     # Remove stale image from cache.
-                    image_escaped=$(regex-escape "${backing_image[i]}") || return $?
-                    $SUDO_CMD $SED_CMD -Ei -e '/^'"$image_escaped"'[[:space:]]+/d' \
+                    image_escaped=$(extended-regex-escape "${backing_image[i]}") || return $?
+                    $SUDO_CMD $SED_CMD -Ei -e '/^'"$image_escaped"'⏹/d' \
                               "$MOUNT_IMAGE_CACHE" || return $?
                 fi
             done
@@ -233,14 +234,7 @@ decompress-image ()
 
         pr-info "${script_name}: ${compressed_image}: Decompressing.  Please wait..."
 
-        case "${compression_specs[0]}" in
-            *zstd*)
-                ${compression_specs[0]} -T0 "$compressed_image" >"$_decompressed_image" || return $?
-                ;;
-            *)
-                ${compression_specs[0]} "$compressed_image" >"$_decompressed_image" || return $?
-                ;;
-        esac
+        ${compression_specs[0]} "$compressed_image" >"$_decompressed_image" || return $?
 
         trap - 0 1 2 15 RETURN
     fi
@@ -252,11 +246,13 @@ log-restore-method ()
     local compressor=$2
     local compressed_image=$3
 
+    # Use field separator: ⏹ (Unicode codepoint U+23f9), and lock
+    # cache while writing.
     $SUDO_CMD $BASH_CMD -c "
-            $INSTALL_CMD -d -m 0755 '${MOUNT_IMAGE_CACHE%/*}/'
+            $INSTALL_CMD -d -m 0755 '${MOUNT_IMAGE_CACHE%/*}'
             {
                $FLOCK_CMD 3
-               printf '${image}\\t${compressor}\\t${compressed_image}\\n' >&3
+               echo -E '${image}⏹${compressor}⏹${compressed_image}' >&3
             } 3>>'$MOUNT_IMAGE_CACHE'" || return $?
 }
 
@@ -307,7 +303,7 @@ maybe-decompress-image ()
         decompress-image "$image" specs decompressed_image existing_images _parameters || return $?
 
         if (( ${#existing_images[*]} == 0 )); then
-            log-restore-method "$decompressed_image" "${specs[0]%% *}" "$image" || return $?
+            log-restore-method "$decompressed_image" "${specs[0]% *}" "$image" || return $?
         fi
 
         image=$decompressed_image
@@ -676,20 +672,22 @@ umount-image ()
 maybe-compress-image ()
 {
     local backing_image=$1
-    local pathname=$2
-    local -n _parameters=$3
+    local -n _parameters=$2
 
     local -a restore_parameters=()
     local backing_image_escaped=''
 
-    backing_image_escaped=$(regex-escape "$backing_image") || return $?
+    backing_image_escaped=$(extended-regex-escape "$backing_image") || return $?
 
     # Assert: $backing_image exists in $MOUNT_IMAGE_CACHE
+
+    # Extract compressor (i.e., ${resotore_parameters[0]}) and original image path
+    # (i.e., ${restore_parameters[1]}), but leave cache unchanged.
     mapfile -t restore_parameters < <(
         $SUDO_CMD $ED_CMD -Es "$MOUNT_IMAGE_CACHE" <<EOF
-g;^$backing_image_escaped[[:space:]]+;\\
+g;^${backing_image_escaped}⏹;\\
 s;;;\\
-s;[[:space:]]+;\\
+s;⏹;\\
 ;
 -,.p
 Q
@@ -701,23 +699,14 @@ EOF
             return 0
         elif test ! -w "${restore_parameters[1]}"; then
             $RM_CMD -f "$backing_image" || return $?
-            $SUDO_CMD $ED_CMD -Es "$MOUNT_IMAGE_CACHE" <<EOF
-/^$backing_image_escaped[[:space:]]+/d
-wq
-EOF
+            $SUDO_CMD $SED_CMD -Ei -e '/^'"${backing_image_escaped}"'⏹/d' \
+                      "$MOUNT_IMAGE_CACHE" || return $?
             return 0
         fi
 
         pr-info "${script_name}: ${restore_parameters[1]%.*}: Compressing. Please wait..."
 
-        case "${restore_parameters[0]}" in
-            *zstd*)
-                ${restore_parameters[0]} -T0 "$backing_image" || return $?
-                ;;
-            *)
-                ${restore_parameters[0]} "$backing_image" || return $?
-                ;;
-        esac
+        ${restore_parameters[0]} "$backing_image" || return $?
 
         local extension=.${restore_parameters[1]##*.}
 
@@ -726,11 +715,8 @@ EOF
 
         # zstd, e.g., does not remove original.
         $RM_CMD -f "$backing_image" || return $?
-
-        $SUDO_CMD $ED_CMD -Es "$MOUNT_IMAGE_CACHE" <<EOF
-/^$backing_image_escaped[[:space:]]+/d
-wq
-EOF
+        $SUDO_CMD $SED_CMD -Ei -e '/^'"${backing_image_escaped}"'⏹/d' \
+                  "$MOUNT_IMAGE_CACHE" || return $?
     fi
 }
 
@@ -767,7 +753,7 @@ parse-command-line ()
                 case "$2" in
                     ro|ro,*|*,ro|*,ro,*)
                         if test ."${params[tmpdir]}" = .''; then
-                            params[tmpdir]=/tmp
+                            params[tmpdir]=$(resolve-existing ~/) || return $?
                         fi
 
                         params[compress]=false
@@ -781,7 +767,7 @@ parse-command-line ()
                 params[shared-cache]=true
                 ;;
             --tmpdir|-t)
-                params[tmpdir]=$2
+                params[tmpdir]=$(resolve-existing "$2") || return $?
                 shift
                 ;;
             --)
@@ -873,13 +859,13 @@ if test ."$0" = ."${BASH_SOURCE[0]}"; then
                 if test -f "$MOUNT_IMAGE_CACHE"; then
                     declare backing_image_escaped=''
 
-                    if ! backing_image_escaped=$(regex-escape "$backing_image"); then
+                    if ! backing_image_escaped=$(extended-regex-escape "$backing_image"); then
                         (( ++exit_status ))
                         continue
                     fi
 
-                    if $GREP_CMD -Eq '^'"$backing_image_escaped"'[[:space:]]+' "$MOUNT_IMAGE_CACHE" 2>/dev/null; then
-                        maybe-compress-image "$backing_image" "$path" parameters || exit $?
+                    if $GREP_CMD -Eq '^'"${backing_image_escaped}"'⏹' "$MOUNT_IMAGE_CACHE" 2>/dev/null; then
+                        maybe-compress-image "$backing_image" parameters || exit $?
                     fi
                 fi
             done
