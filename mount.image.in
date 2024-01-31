@@ -245,6 +245,7 @@ log-restore-method ()
     local image=$1
     local compressor=$2
     local compressed_image=$3
+    local compress=$4
 
     # Use field separator: ⏹ (Unicode codepoint U+23f9), and lock
     # cache while writing.
@@ -252,7 +253,7 @@ log-restore-method ()
             $INSTALL_CMD -d -m 0755 '${MOUNT_IMAGE_CACHE%/*}'
             {
                $FLOCK_CMD 3
-               echo -E '${image}⏹${compressor}⏹${compressed_image}' >&3
+               echo -E '${image}⏹${compressor}⏹${compress}⏹${compressed_image}' >&3
             } 3>>'$MOUNT_IMAGE_CACHE'" || return $?
 }
 
@@ -303,7 +304,8 @@ maybe-decompress-image ()
         decompress-image "$image" specs decompressed_image existing_images _parameters || return $?
 
         if (( ${#existing_images[*]} == 0 )); then
-            log-restore-method "$decompressed_image" "${specs[0]% *}" "$image" || return $?
+            log-restore-method "$decompressed_image" "${specs[0]% *}" "$image" \
+                               "${_parameters[compress]}" || return $?
         fi
 
         image=$decompressed_image
@@ -679,39 +681,46 @@ maybe-compress-image ()
 
     backing_image_escaped=$(extended-regex-escape "$backing_image") || return $?
 
-    # Assert: $backing_image exists in $MOUNT_IMAGE_CACHE
+    local restore_string=''
 
-    # Extract compressor (i.e., ${resotore_parameters[0]}) and original image path
-    # (i.e., ${restore_parameters[1]}), but leave cache unchanged.
-    mapfile -t restore_parameters < <(
+    # Assert: $backing_image exists in $MOUNT_IMAGE_CACHE
+    # Extract from $MOUNT_IMAGE_CACHE:
+    #     1. compressor (i.e., ${restore_parameters[0]}),
+    #     2. whether to compress (i.e., ${restore_parameters[1]}) and
+    #     3. original image path (i.e., ${restore_parameters[2]}),
+    # but leave $MOUNT_IMAGE_CACHE itself unchanged.
+    restore_string=$(
         $SUDO_CMD $ED_CMD -Es "$MOUNT_IMAGE_CACHE" <<EOF
 g;^${backing_image_escaped}⏹;\\
 s;;;\\
 s;⏹;\\
-;
--,.p
+;g
+-2,.p
 Q
 EOF
-    )
+                  ) || return $?
+    mapfile -t restore_parameters <<<"$restore_string"
 
     if (( ${#restore_parameters[*]} > 0 )); then
         if ${_parameters[shared-cache]}; then
             return 0
-        elif test ! -w "${restore_parameters[1]}"; then
+        elif test ."${restore_parameters[1]}" != .'true' \
+                  -o ."${_parameters[compress]}" != 'true' \
+                  -o ! -w "${restore_parameters[2]}"; then
             $RM_CMD -f "$backing_image" || return $?
             $SUDO_CMD $SED_CMD -Ei -e '/^'"${backing_image_escaped}"'⏹/d' \
                       "$MOUNT_IMAGE_CACHE" || return $?
             return 0
         fi
 
-        pr-info "${script_name}: ${restore_parameters[1]%.*}: Compressing. Please wait..."
+        pr-info "${script_name}: ${restore_parameters[2]%.*}: Compressing. Please wait..."
 
         ${restore_parameters[0]} "$backing_image" || return $?
 
-        local extension=.${restore_parameters[1]##*.}
+        local extension=.${restore_parameters[2]##*.}
 
-        $MV_CMD -f "${restore_parameters[1]}" "${restore_parameters[1]}.old" || return $?
-        $MV_CMD -f "${backing_image}${extension}" "${restore_parameters[1]}" || return $?
+        $MV_CMD -f "${restore_parameters[2]}" "${restore_parameters[2]}.old" || return $?
+        $MV_CMD -f "${backing_image}${extension}" "${restore_parameters[2]}" || return $?
 
         # zstd, e.g., does not remove original.
         $RM_CMD -f "$backing_image" || return $?

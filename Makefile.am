@@ -8,5 +8,8 @@ bin_SCRIPTS =								\
 
 AM_DEFAULT_SOURCE_EXT = .in
 
+install-exec-local:
+	ln -sf mount.image ${DESTDIR}${bindir}/umount.image
+
 clean-local:
 	rm -rf $(bin_SCRIPTS) Makefile.in autom4te.cache aclocal.m4 configure config.log config.status *~
