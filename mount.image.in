@@ -705,7 +705,7 @@ EOF
         if ${_parameters[shared-cache]}; then
             return 0
         elif test ."${restore_parameters[1]}" != .'true' \
-                  -o ."${_parameters[compress]}" != 'true' \
+                  -o ."${_parameters[compress]}" != .'true' \
                   -o ! -w "${restore_parameters[2]}"; then
             $RM_CMD -f "$backing_image" || return $?
             $SUDO_CMD $SED_CMD -Ei -e '/^'"${backing_image_escaped}"'⏹/d' \
